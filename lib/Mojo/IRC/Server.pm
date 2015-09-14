@@ -80,6 +80,7 @@ sub new_user{
     $user->io->on(line=>sub{
         my($stream,$line)  = @_;
         my $msg = $s->parser->parse($line);
+        $user->last_active_time(time());
         $s->emit(user_msg=>$user,$msg);
         if($msg->{command} eq "PASS"){$user->emit(pass=>$msg)}
         elsif($msg->{command} eq "NICK"){$user->emit(nick=>$msg);$s->emit(nick=>$user,$msg);}
@@ -90,24 +91,36 @@ sub new_user{
         elsif($msg->{command} eq "PONG"){$user->emit(pong=>$msg);$s->emit(pong=>$user,$msg);}
         elsif($msg->{command} eq "MODE"){$user->emit(mode=>$msg);$s->emit(mode=>$user,$msg);}
         elsif($msg->{command} eq "PRIVMSG"){$user->emit(privmsg=>$msg);$s->emit(privmsg=>$user,$msg);}
-        elsif($msg->{command} eq "QUIT"){$user->emit(quit=>$msg);$s->emit(quit=>$user,$msg);}
+        elsif($msg->{command} eq "QUIT"){$user->is_quit(1);$user->emit(quit=>$msg);$s->emit(quit=>$user,$msg);}
         elsif($msg->{command} eq "WHO"){$user->emit(who=>$msg);$s->emit(who=>$user,$msg);}
         elsif($msg->{command} eq "WHOIS"){$user->emit(whois=>$msg);$s->emit(whois=>$user,$msg);}
         elsif($msg->{command} eq "LIST"){$user->emit(list=>$msg);$s->emit(list=>$user,$msg);}
         elsif($msg->{command} eq "TOPIC"){$user->emit(topic=>$msg);$s->emit(topic=>$user,$msg);}
+        elsif($msg->{command} eq "AWAY"){$user->emit(away=>$msg);$s->emit(away=>$user,$msg);}
         else{$user->send($user->serverident,"421",$user->nick,$msg->{command},"Unknown command");}
     });
 
     $user->io->on(error=>sub{
         my ($stream, $err) = @_;
-        $s->emit(close_user=>$user);
-        $user->emit("close");
+        $user->emit("close",$err);
+        $s->emit(close_user=>$user,$err);
         $s->debug("C[" .$user->name."] 连接错误: $err");
     });
     $user->io->on(close=>sub{
         my ($stream, $err) = @_;
-        $s->emit(close_user=>$user);
-        $user->emit("close");
+        $user->emit("close",$err);
+        $s->emit(close_user=>$user,$err);
+    });
+    $user->on(close=>sub{
+        my ($user,$err) = @_;
+        return if $user->is_quit;
+        my $quit_reason = defined $user->close_reason? $user->close_reason:
+                          defined $err               ? $err               :
+                                                       "remote host closed connection";
+        $user->forward($user->ident,"QUIT",$quit_reason);
+        $user->is_quit(1);
+        $user->info("[" . $user->name . "] 已退出($quit_reason)");
+        $user->{_server}->remove_user($user);
     });
     $user->on(pass=>sub{my($user,$msg) = @_;my $pass = $msg->{params}[0]; $user->pass($pass);});
     $user->on(nick=>sub{my($user,$msg) = @_;my $nick = $msg->{params}[0];$user->set_nick($nick)});
@@ -158,14 +171,19 @@ sub new_user{
     });
     $user->on(ping=>sub{my($user,$msg) = @_;
         my $servername = $msg->{params}[0];
-        $user->send($user->servername,"PONG",$user->servername,$servername);
+        $user->send($user->serverident,"PONG",$user->servername,$servername);
     });
-    $user->on(pong=>sub{});
+    $user->on(pong=>sub{
+        my($user,$msg) = @_;
+        my $current_ping_count = $user->ping_count;
+        $user->ping_count(--$current_ping_count);
+    });
     $user->on(quit=>sub{my($user,$msg) = @_;
         my $quit_reason = $msg->{params}[0];
         $user->quit($quit_reason);
     });
     $user->on(privmsg=>sub{my($user,$msg) = @_;
+        $user->last_speak_time(time());
         if(substr($msg->{params}[0],0,1) eq "#" ){
             my $channel_name = $msg->{params}[0];
             my $content = $msg->{params}[1];
@@ -180,6 +198,7 @@ sub new_user{
             my $u = $user->search_user(nick=>$nick);
             if(defined $u){
                 $u->send($user->ident,"PRIVMSG",$nick,$content);
+                $user->send($user->serverident,"301",$user->nick,$u->nick,$u->away_info) if $u->is_away;
                 $s->info({level=>"IRC私信消息",title=>"[".$user->nick."]->[$nick] :"},$content);
             }
             else{
@@ -227,8 +246,8 @@ sub new_user{
             if(defined $u){
                 my $channel_name = "*";
                 if($u->is_join_channel()){
-                    my $last_channel = ($u->channels)[-1];
-                    $channel_name = $last_channel->name;
+                    my $last_channel = (grep {$_->mode !~ /s/} $u->channels)[-1];
+                    $channel_name = $last_channel->name if defined $last_channel;
                 }
                 $user->send($user->serverident,"352",$user->nick,$channel_name,$u->user,$u->host,$u->servername,$u->nick,"H","0 " . $u->realname);
                 $user->send($user->serverident,"315",$user->nick,$nick,"End of WHO list");
@@ -259,6 +278,16 @@ sub new_user{
             $user->send($user->serverident,"332",$user->nick,$channel_name,$channel->topic);
         }
     });
+    $user->on(away=>sub{my($user,$msg) = @_;
+        if($msg->{params}[0]){
+            my $away_info = $msg->{params}[0];
+            $user->away($away_info); 
+        }
+        else{
+            $user->back();
+        }
+    });
+
     $user;
 }
 sub new_channel{
@@ -314,6 +343,7 @@ sub remove_user{
     for(my $i=0;$i<@{$s->user};$i++){
         if($user->id eq $s->user->[$i]->id){
             $_->remove_user($s->user->[$i]->id) for $s->user->[$i]->channels;
+            $user->channel([]);
             splice @{$s->user},$i,1;
             if($user->is_virtual){
                 $s->info("c[".$user->name."] 已被移除");
@@ -422,7 +452,20 @@ sub ready {
 
     $s->on(close_user=>sub{
         my ($s,$user,$msg)=@_;
-        $s->remove_user($user);
+    });
+
+    $s->interval(60,sub{
+        for(grep {defined $_->last_active_time and time() - $_->last_active_time > 60 } grep {!$_->is_virtual} $s->users){
+            if($_->ping_count >=3 ){
+                $_->close_reason("PING timeout 180 seconds");
+                $_->io->close_gracefully();  
+            }
+            else{
+                $_->send(undef,"PING",$_->servername);
+                my $current_ping_count = $_->ping_count;
+                $_->ping_count(++$current_ping_count);
+            }
+        }
     });
 }
 sub run{
